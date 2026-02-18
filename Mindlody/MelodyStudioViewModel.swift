@@ -888,7 +888,7 @@ final class MelodyStudioViewModel: NSObject, ObservableObject {
             bpm: bpm,
             scale: scalePreset,
             style: selectedStylePreset,
-            globalShift: styleGlobalSemitoneShift,
+            globalShift: 0,
             outputURL: outputURL
         )
 
@@ -1574,7 +1574,6 @@ private enum PianoRenderer {
             )
         }
         let degreeSet = Set(request.scale.degrees)
-        let progression = chordProgression(style: request.style, scale: request.scale)
         return try await Task.detached(priority: .userInitiated) {
             let sampleRate = 44_100.0
             let tail = 0.8
@@ -1591,7 +1590,7 @@ private enum PianoRenderer {
                 let st = max(0, note.startTime)
                 let dur = max(0.06, note.endTime - note.startTime)
                 let midi = note.outputMidi + Double(request.globalShift)
-                addPianoNote(buffer: &pcm, sampleRate: sampleRate, start: st, duration: dur, midi: midi, gain: 0.42)
+                addPianoNote(buffer: &pcm, sampleRate: sampleRate, start: st, duration: dur, midi: midi, gain: 0.56)
                 if idx % 3 == 0 {
                     progress(0.1 + 0.45 * Double(idx + 1) / Double(max(notes.count, 1)))
                 }
@@ -1600,14 +1599,27 @@ private enum PianoRenderer {
             let beatSec = 60.0 / max(40, min(240, request.bpm))
             let tonic = estimateTonicMidi(from: notes, degreeSet: degreeSet)
             let beatCount = Int(ceil(request.duration / beatSec))
+            var lastAnchor = tonic
 
             for beat in 0..<beatCount {
                 let t = Double(beat) * beatSec
-                let chordRoot = tonic + progression[beat % progression.count]
-                let chord = [chordRoot, chordRoot + 7, chordRoot + 12]
-                addPianoNote(buffer: &pcm, sampleRate: sampleRate, start: t, duration: beatSec * 0.92, midi: Double(chord[0] - 12), gain: 0.26)
-                addPianoNote(buffer: &pcm, sampleRate: sampleRate, start: t, duration: beatSec * 0.82, midi: Double(chord[1]), gain: 0.17)
-                addPianoNote(buffer: &pcm, sampleRate: sampleRate, start: t, duration: beatSec * 0.82, midi: Double(chord[2]), gain: 0.15)
+                let window = beatSec * 2
+                let (anchor, hasMelody) = anchorFromMelody(at: t, window: window, notes: notes, fallback: lastAnchor)
+                lastAnchor = anchor
+                guard hasMelody else {
+                    if beat % 2 == 0 {
+                        progress(0.58 + 0.3 * Double(beat + 1) / Double(max(beatCount, 1)))
+                    }
+                    continue
+                }
+
+                let root = snapToScale(midi: anchor - 12, tonic: tonic, degreeSet: degreeSet)
+                let fifth = snapToScale(midi: root + 7, tonic: tonic, degreeSet: degreeSet)
+                let octave = root + 12
+
+                addPianoNote(buffer: &pcm, sampleRate: sampleRate, start: t, duration: beatSec * 0.9, midi: Double(root), gain: 0.18)
+                addPianoNote(buffer: &pcm, sampleRate: sampleRate, start: t + beatSec * 0.05, duration: beatSec * 0.72, midi: Double(fifth), gain: 0.11)
+                addPianoNote(buffer: &pcm, sampleRate: sampleRate, start: t + beatSec * 0.1, duration: beatSec * 0.68, midi: Double(octave), gain: 0.09)
                 if beat % 2 == 0 {
                     progress(0.58 + 0.3 * Double(beat + 1) / Double(max(beatCount, 1)))
                 }
@@ -1726,6 +1738,44 @@ private enum PianoRenderer {
             if s < score || (s == score && abs(c - median) < abs(best - median)) {
                 score = s
                 best = c
+            }
+        }
+        return best
+    }
+
+    nonisolated private static func anchorFromMelody(
+        at time: Double,
+        window: Double,
+        notes: [PianoNoteData],
+        fallback: Int
+    ) -> (anchor: Int, hasMelody: Bool) {
+        let start = max(0, time - window * 0.15)
+        let end = time + window
+        let active = notes.filter { $0.endTime > start && $0.startTime < end }
+        guard !active.isEmpty else {
+            return (fallback, false)
+        }
+        let pitches = active.map { Int(round($0.outputMidi)) }.sorted()
+        let median = pitches[pitches.count / 2]
+        return (median, true)
+    }
+
+    nonisolated private static func snapToScale(
+        midi: Int,
+        tonic: Int,
+        degreeSet: Set<Int>
+    ) -> Int {
+        if degreeSet.isEmpty { return midi }
+        var best = midi
+        var bestDistance = Int.max
+        for step in -6...6 {
+            let candidate = midi + step
+            let degree = ((candidate - tonic) % 12 + 12) % 12
+            guard degreeSet.contains(degree) else { continue }
+            let distance = abs(step)
+            if distance < bestDistance {
+                bestDistance = distance
+                best = candidate
             }
         }
         return best
